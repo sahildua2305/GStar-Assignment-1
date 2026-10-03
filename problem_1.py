@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 
+
 class FlashAttention2Function(torch.autograd.Function):
     """
     A pure PyTorch implementation of the FlashAttention-2 forward pass.
@@ -57,16 +58,30 @@ class FlashAttention2Function(torch.autograd.Function):
                         
                         # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
                         # 1. Apply causal masking if is_causal is True.
-                        #
+                        if is_causal:
+                            q_indices = torch.arange(q_start, q_end, device=S_ij.device)
+                            k_indices = torch.arange(k_start, k_end, device=S_ij.device)
+                            causal_mask = q_indices[:, None] < k_indices[None, :]
+                            S_ij = S_ij.masked_fill_(causal_mask, -float("inf"))
+
                         # 2. Compute the new running maximum
-                        #
+                        m_ij = torch.amax(S_ij, dim=-1)
+                        m_new = torch.maximum(m_i, m_ij)
+
                         # 3. Rescale the previous accumulators (o_i, l_i)
-                        #
+                        alpha = torch.exp(m_i - m_new)
+                        l_i = alpha * l_i
+                        o_i = alpha[:, None] * o_i.float()
+
                         # 4. Compute the probabilities for the current tile, P_tilde_ij = exp(S_ij - m_new).
-                        #
+                        P_tilde_ij = torch.exp(S_ij - m_new[:, None])
+
                         # 5. Accumulate the current tile's contribution to the accumulators to update l_i and o_i
-                        #
+                        l_i = l_i + torch.sum(P_tilde_ij, dim=-1)
+                        o_i = o_i + P_tilde_ij @ V_tile.float()
+
                         # 6. Update the running max for the next iteration
+                        m_i = m_new
                         
                         # --- END OF STUDENT IMPLEMENTATION ---
 
@@ -85,7 +100,6 @@ class FlashAttention2Function(torch.autograd.Function):
 
         ctx.save_for_backward(Q, K, V, O_final, L_final)
         ctx.is_causal = is_causal
- 
         return O_final, L_final
     
     @staticmethod

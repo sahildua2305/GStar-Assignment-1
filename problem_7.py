@@ -54,10 +54,113 @@ def _flash_attention_forward_swa_kernel(
     # Combine the GQA, SWA, and Sink logic.
     # Combine all code from previous problems, and add the sink logic.
     # You should have 3 phases:
-    # 1. Phase 0: Sink blocks that are before the sliding window
-    # 2. Phase 1: Off-Diagonal Blocks (within the window)
-    # 3. Phase 2: Diagonal Blocks
-    pass
+    
+    # Phase 0: Sink blocks that are before the sliding window
+    for start_n in range(0, SINK_SIZE, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        s_ij = tl.where(causal_mask, s_ij, -1.0e6)
+        sink_mask = k_offsets[None, :] < SINK_SIZE
+        s_ij = tl.where(sink_mask, s_ij, -1.0e6)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=-1)
+        m_new = tl.maximum(m_i, m_ij)
+
+        alpha = tl.exp2(m_i - m_new)
+        l_i = alpha * l_i
+        acc = alpha[:, None] * acc.to(tl.float32)
+
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+
+        l_i += tl.sum(p_ij, axis=-1)
+        acc += tl.dot(p_ij, v_block.to(tl.float32))
+
+        m_i = m_new
+
+    # Phase 1: Off-Diagonal Blocks (within the window)
+    window_start = max(0, q_block_idx * BLOCK_M - WINDOW_SIZE + 1)
+    window_start = window_start - window_start % BLOCK_N
+    for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        # 2. Compute the attention scores (S_ij).
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        swa_mask = q_offsets[:, None] - k_offsets[None, :] < WINDOW_SIZE
+        s_ij = tl.where(swa_mask, s_ij, -1.0e6)
+        sink_mask = k_offsets[None, :] >= SINK_SIZE
+        s_ij = tl.where(sink_mask, s_ij, -1.0e6)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+        m_ij = tl.max(s_ij, axis=-1)
+        m_new = tl.maximum(m_i, m_ij)
+
+        alpha = tl.exp2(m_i - m_new)
+        l_i = alpha * l_i
+        acc = alpha[:, None] * acc.to(tl.float32)
+
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+
+        l_i += tl.sum(p_ij, axis=-1)
+        acc += tl.dot(p_ij, v_block.to(tl.float32))
+
+        m_i = m_new
+
+    # Phase 2: Diagonal Blocks
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+
+        causal_mask = q_offsets[:, None] >= k_offsets[None, :]
+        s_ij = tl.where(causal_mask, s_ij, -1.0e6)
+        swa_mask = q_offsets[:, None] - k_offsets[None, :] < WINDOW_SIZE
+        s_ij = tl.where(swa_mask, s_ij, -1.0e6)
+        sink_mask = k_offsets[None, :] >= SINK_SIZE
+        s_ij = tl.where(sink_mask, s_ij, -1.0e6)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        m_ij = tl.max(s_ij, axis=-1)
+        m_new = tl.maximum(m_ij, m_i)
+
+        alpha = tl.exp2(m_i - m_new)
+        l_i *= alpha
+        acc = alpha[:, None] * acc.to(tl.float32)
+
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+
+        acc += tl.dot(p_ij, v_block.to(tl.float32))
+        l_i += tl.sum(p_ij, axis=-1)
+
+        m_i = m_new
+
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.

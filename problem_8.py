@@ -434,10 +434,12 @@ def _attn_bwd_dk_dv(
         dpT_block = tl.dot(V_block, tl.trans(dO_block)).to(tl.float32)
         dS_T_block = P_T_block * (dpT_block - Di[None, :])
 
-        dK_block += qk_scale * tl.dot(dS_T_block.to(qT_block.dtype), tl.trans(qT_block))
+        dK_block += tl.dot(dS_T_block.to(qT_block.dtype), tl.trans(qT_block))
         curr_q += BLOCK_SIZE_Q
         qT_ptrs += BLOCK_SIZE_Q * stride_seq
         dO_ptrs += BLOCK_SIZE_Q * stride_seq
+
+    dK_block *= softmax_scale
 
     dK_block_ptrs = (
         dK
@@ -543,6 +545,8 @@ def _attn_bwd_dq(
         curr_kv += BLOCK_KV
         kT_ptrs += BLOCK_KV * stride_seq
         vT_ptrs += BLOCK_KV * stride_seq
+
+    dQ_block *= softmax_scale
 
     dQ_block_ptrs = dQ + offs_q[:, None] * stride_seq + offs_dim[None, :] * stride_dim
     tl.store(dQ_block_ptrs, dQ_block)
